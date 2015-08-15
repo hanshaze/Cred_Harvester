@@ -1,0 +1,483 @@
+GUIDE TO FERRET CODE
+
+
+ABSTRACT: This document describes 'strategic' ideas in the Ferret code.
+These are things that are found globally throughout the code and aren't
+documented in the individual files. Some of these bits are unconterversial
+design decisions, others are stranges ideas that experienced programmers
+may disagree with, or find unexpected.
+
+
+
+****************************************
+1. INTERNAL VS. EXTERNAL DATA STRUCTURES
+----------------------------------------
+
+Ferret separates "internal" data structures and "external" packet formats
+to an unusual degree.
+
+The usual way of writing network code in C is to mix internal and external
+data structures. A programmer writes a C data structure to correspond to
+how data is layed out in a packet. This often requires special compiler
+features, such as the "packed" pragma, to make this work. A pointer into
+data within a network packet is then cast to this internal data structure.
+Structure members are then referenced as if the structure were internal.
+This method is considered 'elegant', and is the official way taught by 
+revered programmers such as Comer, Stevens, Kernighan, and Ritchie.
+
+However, Ferret does it a different way. Internal structures are never
+defined to correspond to an external protocol. Instead, data is "marshalled"
+or extracted a single byte at a time from the packet.
+
+We do this so that:
+#1 we don't have to reassemble packets (seee STATE-MACHINES below).
+#2 we don't have to swap bytes (i.e. don't have byte-order issues)
+#3 we don't have to align words (RISC processors often crash on 
+   unaligned accesses to multi-byte integers)
+#4 we don't have portability problems of trying to pack structures
+   for different compilers
+
+
+This is an example of the traditional way of decoding data
+from a packet:
+
+	void decode_udp(char *p)
+	{
+		struct UDP {
+			short source_port;
+			short destination_port;
+			short checksum;
+			short length;
+		} *udp;
+
+		udp = (struct UDP*)p;
+		printf("src = %d\n", ntohs(udp->source_port));
+		printf("dst = %d\n", ntohs(udp->destination_port));
+		printf("sum = %d\n", ntohs(udp->checksum));
+		printf("len = %d\n", ntohs(udp->length));
+	}
+
+
+The following is the method we prefer:
+
+	void decode_udp(const unsigned char *p)
+	{
+		struct UDP {
+			int source_port;
+			int destination_port;
+			int checksum;
+			int length;
+		} udp;
+
+		udp.source_port = p[0]<<8 | p[1];
+		udp.destination_port = p[2]<<8 | p[3];
+		udp.length = p[4]<<8 | p[5];
+		udp.checksum = p[6]<<8 | p[7];
+
+		printf("src = %d\n", ntohs(p->source_port));
+		printf("dst = %d\n", ntohs(p->destination_port));
+		printf("len = %d\n", ntohs(p->length));
+		printf("sum = %d\n", ntohs(p->checksum));
+	}
+
+Note that we use the 'int' type (which is usually 32-bits) to represent the
+port numbers, even though the original field within the packet is only
+16-bits. This is becauase the 'int' is the type that is most efficiently
+processed by C code. The idea is that the internal structures should be
+written to correspond to internal ideas without prejudice from how they were
+originually structured in the external packets.
+
+
+
+*********************************
+2. STATE-MACHINE PROTOCOL-PARSERS
+---------------------------------
+
+Ferret parses TCP application-layer protocols using 'state-machines'.
+
+The usual way of writing network code is to first reassemble a TCP stream
+so that all the data is together in memory.
+
+However, Ferret does it a different way. Bytes in a packet are processed 
+one at a time. Once a byte is processed, we don't go backwards and process 
+it again. 
+
+
+For example, a TCP header might look like this:
+
+	GET /index.html HTTP/1.0
+	User-Agent: test
+	Content-Length: 1934
+
+A state-machine that parses an HTTP header might look like the
+following. Note that we aren't doing anything useful at the moment
+with this state-machine, other than correctly parsing the header.
+
+#include <stdio.h>
+#include <ctype.h>
+unsigned parse_http(
+	unsigned *r_state, 
+	const unsigned char *px, unsigned length)
+{
+	unsigned state=*r_state, offset=0;
+	enum {	S_METHOD,S_METHOD_URL,S_URL,S_URL_VERSION, S_VERSION,
+		S_NEWLINE,S_NAME,S_NAME_VALUE,S_VALUE,S_END };
+	while (offset<length && state != S_END) {
+		unsigned char c = px[offset++];
+		switch (state) {
+		case S_METHOD:
+			if (isspace(c))			printf("-> %d\n", state = S_METHOD_URL);
+			break;
+		case S_METHOD_URL:
+			if (c == '\n')			printf("-> %d\n", state = S_NEWLINE);
+			else if (!isspace(c))	printf("-> %d\n", state = S_URL);
+			break;
+		case S_URL:
+			if (c == '\n')			printf("-> %d\n", state = S_NEWLINE);
+			else if (isspace(c))	printf("-> %d\n", state = S_URL_VERSION);
+			break;
+		case S_URL_VERSION:
+			if (c == '\n')			printf("-> %d\n", state = S_NEWLINE);
+			else if (!isspace(c))	printf("-> %d\n", state = S_VERSION);
+			break;
+		case S_VERSION:
+			if (c == '\n')			printf("-> %d\n", state = S_NEWLINE);
+			break;
+		case S_NEWLINE:
+			if (c == '\r')			printf("-> %d\n", state = S_NEWLINE);
+			else if (c == '\n')		printf("-> %d\n", state = S_END);
+			else if (c == ':')		printf("-> %d\n", state = S_NAME_VALUE);
+			else					printf("-> %d\n", state = S_NAME);
+			break;
+		case S_NAME:
+			if (c == '\n')			printf("-> %d\n", state = S_NEWLINE);
+			else if (c == ':')		printf("-> %d\n", state = S_NAME_VALUE);
+			break;
+		case S_NAME_VALUE:
+			if (c == '\n')			printf("-> %d\n", state = S_NEWLINE);
+			else if (!isspace(c))	printf("-> %d\n", state = S_VALUE);
+			break;
+		case S_VALUE:
+			if (c == '\n')			printf("-> %d\n", state = S_NEWLINE);
+			break;
+		}
+		if (!isspace(c)) printf("%c", c);
+	}
+	*r_state = state;
+	return offset;
+}
+int main() {
+	const unsigned char px[] =
+		"GET /index.html HTTP/1.0\r\n"
+		"User-Agent: test\r\n"
+		"Content-Length: 1934\r\n"
+		"\r\n";
+	unsigned state=0;
+	parse_http(&state, px,	sizeof(px));
+	return 0;
+}
+
+
+The output from this sample program is the following data. Note how
+a state transition occurs after every field:
+
+GET-> 1
+-> 2
+/index.html-> 3
+-> 4
+HTTP/1.0-> 5
+-> 6
+User-Agent-> 7
+:-> 8
+test-> 5
+-> 6
+Content-Length-> 7
+:-> 8
+1934-> 5
+-> 5
+-> 9
+
+
+Note that Microsoft's IIS web-server also uses state-machines, but the Apache
+web-server doesn't. In the code above, as well as IIS, you could have
+5-billion spaces after the 'GET' and before the '/' -- or an infinite number.
+However, Apache reads up to 16k as a before before processing, and thus
+would only allow slightly less than 16k worth of spaces. An advantage of using
+state-machines is that we can track very "large" operations without having to
+use a lot of system resources, such as tracking large HTTP requests without
+having to actually buffer the entire request.
+
+
+
+*********************************
+3. TCP STREAM FRAG PARSERS
+---------------------------------
+
+The advantage of using 'state-machines' described above is that we no longer
+need to reassemble TCP streams. Instead, once we reach the end of one fragment, 
+we remember the state, and continue were we left off.
+
+The following is the same code as the state-machine described above,  but
+it calls the parser functions.
+
+int main() {
+	const unsigned char px[] =
+		"GET /index.html HTTP/1.0\r\n"
+		"User-Agent: test\r\n"
+		"Content-Length: 1934\r\n"
+		"\r\n";
+	unsigned state=0; /*remember between calls*/
+	parse_http(&state, px,		10);
+	parse_http(&state, px+10,	10);
+	parse_http(&state, px+20,	10);
+	parse_http(&state, px+30,	10);
+	parse_http(&state, px+40,	10);
+	parse_http(&state, px+50,	sizeof(px)-50);
+	return 0;
+}
+
+This will produce the identical results as the previous example above, even 
+though we've "fragmented" the data.
+
+
+
+*********************************
+4. LATE BUFFER REASSEMBLY
+---------------------------------
+
+While we don't have to reassemble TCP streams in general, we do have to
+worry about reassembling at the individual buffer level. For example, we
+want to print the URL. If the URL spans packets, we need to reassemble it
+back into a URL buffer.
+
+However, in the normal case, the URL will be in a single packet. Only in 
+rare cases will it span packets. Therefore, if the URL is in a packet, we
+don't want to make a copy of it, but instead want to analyze it "in-place".
+
+This is done through the 'strfrag' code. Each TCP stream has a few empty
+strfrag buffers attached to it for general use. As fields are 'copied' into
+the strfrag buffer, it notices that it's from the packet, and just maintains
+a pointer to the packet.
+
+After the application layer parser is done, the underlying TCP code will look
+for any strfrag buffers that it left around (and is presumably not finished
+with yet). It will then allocate memory, copy the data from the packet into
+the memory, and then change the pointers to point into the allocated memory
+instead of the packet. When the next packet continues, data is then copied
+instead of using a packet pointer.
+
+Thus, if the buffers are wholly contained within a packet, then no allocation
+or copies occur, and the data is handled raw from the packet.
+
+
+
+*********************************
+5. OBJECT MODEL
+---------------------------------
+
+Ferret is written in low-level C, but we can describe parts of its design
+using high-level diagrams. The following uses the "Universal Modeling 
+Language" or "UML" to describe some of the key objects in the system:
+
+                  +-----------+       +-----------+
+                  |  Ferret   |  1   +|  Engine   |
+                  +-----------+<*>--->+-----------+
+                  |           |       |           |
+                  |           |       |           |
+                  +-----------+       +-----------+
+                                           <*>
+                                            | 1
+                                            |
+                                            | *
+                                            V
+                  +-----------+       +-----------+
+                  |Application|1    1 |  Stream   |
+                  +-----------+<---<*>+-----------+
+                  | state     |       |           |
+                  |           |       |           |
+                  +-----^-----+       +-----------+
+                       / \
+                      /___\
+                        |
+             +----------+----+---------------+---------------+
+             |               |               |               |	    
+       +-----+-----+   +-----+-----+   +-----+-----+   +-----+-----+	  
+       |    HTTP   |   |  AOL IM   |   |    SMTP   |   |    ...    |	  
+       +-----------+   +-----------+   +-----------+   +-----------+	  
+       |           |   |           |   |           |   |           |	  
+       |           |   |           |   |           |   |           |	  
+       +-----------+   +-----------+   +-----------+   +-----------+
+
+
+A typical network trace will contain lots of connections by web-browsers to
+web-servers using the HTTP protocol. We can an "HTTP Application Stream"
+object instance for each one of these connections. This object is derrived
+from the general class of "Application Streams". The "Application" specific
+stuff is in a separate object from the "Stream" stuff, although there is
+only Application associated with a stream.
+
+
+
+*********************************
+6. INTEGER TYPES
+---------------------------------
+
+The code uses the 'raw' integers as much as possible. This means it uses
+plain old 'int', 'unsigned', 'unsigned char', etc. It does not use better
+defined integers, like 'int32_t' or 'UCHAR'.
+
+The 'char' type is signed on some compilers, and unsigned on others. We 
+generally always use the 'unsigned char' type, especially when pointing
+to data extracted from packets. We use this to avoid getting sign-extensions
+when expanding to a large integer.
+
+The code uses the 'int' and 'unsigned' types with the assumption that they
+are AT LEAST 32-bit wide, but MAYBE more (such as 64-bits). Virtually none 
+of the code depends upon them being ONLY 32-bits wide. There is one exception
+that depend upon the integers being small, such as TCP sequence number 
+mathematics, that assumes a 2s-complement over/under-flow as a 
+appropriate.
+
+The "__int64" type is used when the number must be AT LEAST 64-bits wide.
+the C99 standard says that we should be able to use "long long", but there
+are a lot of compilers that aren't up to that standard yet, so we just
+use the Microsoft "__int64" and #define it to 'long long' everywhere else.
+
+Generally, all integers are 'unsigned'. A common security vulnerability
+is when an 'int' value overflows and suddenly becomes negative, forcing
+buffers to be copied backwards. Keeping arithmetic in the 'unsigned' space
+helps avoid this problem.
+
+Another type convention we use heavily is "const". Pointers to data that
+won't change in a function are declared "const", preventing bugs that
+accidentally change data when their callers don't want them too. Most
+importantly, packet data is always a "const unsigned char": a common bug
+in network code is protocol parsers that temporarily change data.
+
+
+
+*********************************
+7. MEMORY ALLOCATION
+---------------------------------
+
+The current code relies upon a raw 'malloc()' for most tasks, including
+things like TCP fragment re-ordering. We'll fix that in the future.
+
+Raw malloc() is bad for several reasons. One is performance. High-performance
+network code is better served by using "object pools", where a queue of 
+frequently allocated fixed-size objects is kept by the system. Allocations
+and frees are from that pool. New objects are allocated using malloc(), and
+unused objects are eventually freed if they have been unused for a long time.
+Using an object pool can improve performance in a number of ways. One way
+is that the extra code used by malloc trying to coalesce freed memory is
+never run. Another reason is that the pooled memory is more likley to be
+in the processor's cache, avoiding an cache-miss.
+
+Another reason using raw malloc() is bad is because hackers can attack it.
+For example, a hacker could send a large amount of 1-byte fragments
+that must be tracked by the TCP re-ordering systme (because the first fragment
+is missing). This will generate a large number of small allocations.
+A more efficient buffering system would prevent this sort of problem.
+
+Finally, using raw malloc() means there is more of a chance of memory
+leaks.
+
+We do have a memory-leak tracking system (malloctrac.c) that keeps track
+of memory allocations and potential buffer overruns. Part of the regression
+tests makes sure that when the program exits, memory allocations go back
+to zero.
+
+
+
+*********************************
+8. CODE COVERAGE AND SAMPLING
+---------------------------------
+
+The problem with network code is that there is a near infinite combination
+of data patterns. Because are so many different versions of software using
+the same protocol, you'll see a lot of combinations in the real-world.
+Because hackers don't follow the protocols and do something different,
+you'll get even more combinations targetting your code.
+
+A defense against this is having robust "code coverage" in the regression
+test. Ideally, you want every code path to be tested by a test case. In
+the case of Ferret, we maintain a library of packet captures that test
+every code paths.
+
+Conversely, it means that if we don't have a test case, we shouldn't add
+code. Thus, if a protocol spec allows for a certain option, but we can't
+find a real-world example of that option being used, then we shouldn't add
+code for it.
+
+Thus, the ability to develop code depends heavily on finding samples 
+collected from real networks. This in turn requires a distributed,
+cooperative arrangement. Code-paths that aren't followed will trigger
+a flag. The system can be set up so all packets triggering this
+sampling flag will be saved to a special capture file. Developers can
+install the program on busy networks in this mode, collecting the 
+sampling file, then sending it back to us to help development.
+
+
+*********************************
+9. RUNTIME LOAD LIBRARY
+---------------------------------
+
+Ferret loads the 'libpcap' library at runtime rather than loadtime.
+Thus, if the user doesn't have the library installed, they will get
+a more friendly error message rather than an incomprehensible message
+about a library not being found.
+
+This is done on most Windows and Linux platforms. However, some don't have
+libpcap in a shared object, so the "gcc4-static" Makefile builds using
+libpcap.a static library. For example, the Backtrack 2.0 CD does not
+have libpcap.so, so we statically link for that platform.
+
+
+
+*********************************
+10. TIMESTAMPS FROM FILE
+---------------------------------
+
+Time is tracked by "packet-time" rather than "system-time". This means
+that we can simulate things like "TCP connection timeouts" from 
+packet captures. Even though the real time ellapsed while analyzing a
+file may only be a few seconds, the code will think think that original
+time has ellapsed, which could be hours.
+
+This further allows packet-captures to be used for regression tests. Two
+runs of the same packet captures should produce identical results, even
+if one run is on a little-endian, slow system like a 376-MHz ARM processor
+on the Nokia n800, or a big-endian, fast system like a PlayerStation 3.
+
+
+*********************************
+11. NO ./CONFIGURE SCRIPTS
+---------------------------------
+
+The code is written to avoid platform dependencies, so we don't need
+Linux ./configure scripts at this time. In theory, you should just
+be able to compile all the source files together and have it run.
+We have provided a couple different Makefiles that should work.
+
+
+*********************************
+12. HOUSEKEEPING
+---------------------------------
+
+There is a single module for 'housekeeping' that tracks when things 
+need to be cleaned up.
+
+For example, when we create a TCP connection, we register a callback
+with the housekeeping service to be called 15-minutes later. When 
+called back, the TCP module will re-register itself 15-minutes since
+the last time that activity was seen on the connection. However, if 
+no activity has been seen, it will close the application protocol
+(freeing up application objects) and delete the TCP connection entry.
+
+
+*********************************
+A. OTHER READING
+---------------------------------
+http://myweb.cableone.net/xnih/download/OS%20FingerPrint.pdf
+
+
